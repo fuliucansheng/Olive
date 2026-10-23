@@ -172,6 +172,8 @@ def get_ort_inference_session(
         execution_provider: list. List of execution providers to use. Can be a list of provider names or a list of
             (provider name, provider options) tuples.
         provider_options: list, optional. List of provider options for the execution providers.
+        allow_cpu_fallback: bool, optional. Defaults to True. Set False for a non-CPU target to reject
+            implicit CPU node placement as well as an unavailable requested provider.
     :param use_ort_extensions: Whether to use onnxruntime-extensions. Default is False.
     :param device_id: Optional device id to use for CUDA or DML execution providers.
     :param external_initializers: Optional external initializers for the session. A dictionary of external initializer
@@ -230,11 +232,28 @@ def get_ort_inference_session(
         sess_options.log_severity_level = log_severity_level
 
     # execution providers and provider options
+    allow_cpu_fallback = inference_settings.get("allow_cpu_fallback", True)
+    if not isinstance(allow_cpu_fallback, bool):
+        raise ValueError("allow_cpu_fallback must be a bool.")
+    available_providers = get_ort_available_providers()
     providers, provider_options = check_and_normalize_provider_args(
         inference_settings.get("execution_provider"),
         inference_settings.get("provider_options"),
-        get_ort_available_providers(),
+        available_providers,
     )
+    if not allow_cpu_fallback:
+        if not providers or "CPUExecutionProvider" in providers:
+            raise ValueError("allow_cpu_fallback=False requires explicit non-CPU execution providers.")
+        missing = [provider for provider in providers if provider not in available_providers]
+        if missing:
+            raise OrtSessionFallbackError(
+                f"Requested providers {missing} are unavailable; available providers: {available_providers}."
+            )
+        if (extra_session_config or {}).get("session.disable_cpu_ep_fallback", "1") != "1":
+            raise ValueError("allow_cpu_fallback=False conflicts with session.disable_cpu_ep_fallback.")
+        # InferenceSession.disable_fallback() only controls the Python EP retry.
+        # This separate ORT setting rejects implicit CPU graph-node placement.
+        sess_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     for idx, provider in enumerate(providers):
         if provider in ["CUDAExecutionProvider", "DmlExecutionProvider"] and device_id is not None:
             provider_options[idx]["device_id"] = str(device_id)

@@ -212,6 +212,16 @@ _static_optional_config = {
             tensor-level quantization overrides.
         """,
     ),
+    "decompose_fused_conv": PassConfigParam(
+        type_=bool,
+        default_value=False,
+        description=(
+            "Opt in to decomposing com.microsoft.FusedConv into standard Conv/Relu before static quantization "
+            "for a target that cannot execute the fused operator. Identity and Relu without activation parameters "
+            "are supported; residual inputs or unsupported semantics fail before calibration. "
+            "This does not require every Conv to be quantized or prohibit mixed precision."
+        ),
+    ),
     "prepare_qdq_config": PassConfigParam(
         type_=bool,
         default_value=True,
@@ -419,6 +429,23 @@ class OnnxQuantization(Pass):
                 extra_options[key] = run_config[value]
             # remove the key from run_config
             run_config.pop(value, None)
+
+        decompose = run_config.pop("decompose_fused_conv", False)
+        if decompose:
+            if not is_static:
+                raise ValueError("decompose_fused_conv is supported only for static quantization.")
+            from olive.passes.onnx.fused_conv import decompose_fused_conv
+
+            decomposed_path = (
+                Path(self.tmp_dir.name)
+                / "decomposed"
+                / hash_string(str(Path(model.model_path).resolve()))[:8]
+                / "model.onnx"
+            )
+            decomposed_path.parent.mkdir(exist_ok=True, parents=True)
+            decomposed = decompose_fused_conv(onnx.load(model.model_path))
+            model_proto_to_file(decomposed, decomposed_path, save_as_external_data=True)
+            model = ONNXModelHandler(LocalFile({"path": decomposed_path}))
 
         # preprocess the model
         # we hash the entire path of the input model to ensure we are not accidentally using a preprocessed model

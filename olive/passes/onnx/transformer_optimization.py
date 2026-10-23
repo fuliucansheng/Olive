@@ -273,9 +273,16 @@ class OrtTransformersOptimization(Pass):
             import onnxruntime as ort
             from packaging import version
 
+            target_provider = self.accelerator_spec.execution_provider
+            if run_config["opt_level"] > 0 and target_provider not in ort.get_available_providers():
+                raise ValueError(
+                    f"Requested optimization provider {target_provider!r} is unavailable; "
+                    f"available providers: {ort.get_available_providers()}. "
+                    "An offline symbolic pass must use opt_level=0."
+                )
             if (
                 version.parse(ort.__version__) >= version.parse("1.17.0")
-                and self.accelerator_spec.execution_provider in ort.get_available_providers()
+                and target_provider in ort.get_available_providers()
             ):
                 # TODO(myguo): please consider move EP check with available providers to transformer.optimize_model
                 # from the time being, if ORT doesn't have TensorRT EP, the create inference session would fail
