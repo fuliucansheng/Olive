@@ -93,10 +93,11 @@ def get_ort_available_providers():
         # what ORT was built with. Session will be created directly with InferenceSession(model_path, providers=["ProviderName"])
         return ort.get_available_providers()
 
-    # only return registered EPs since session with be created with SessionOptions.add_provider_for_devices()
+    # Built-in providers may be available without a registered plugin EP device.
     # this is ordered by priority
     all_providers = ort.get_all_providers()
     available_provider_set = {ep_device.ep_name for ep_device in ort.get_ep_devices()}
+    available_provider_set.update(ort.get_available_providers())
     return [ep_name for ep_name in all_providers if ep_name in available_provider_set]
 
 
@@ -273,7 +274,27 @@ def get_ort_inference_session(
         sess_options.enable_mem_pattern = False
 
     sess_kwargs = {}
-    if ort_supports_ep_devices():
+    use_ep_devices = ort_supports_ep_devices()
+    if use_ep_devices:
+        registered_ep_names = {ep_device.ep_name for ep_device in ort.get_ep_devices()}
+        built_in_providers = set(ort.get_available_providers())
+        built_in_only = built_in_providers - registered_ep_names
+        if any(provider in built_in_only for provider in providers):
+            # Keep the complete requested order/options on the legacy constructor path.
+            # Adding some device EPs first would change priority relative to built-in EPs.
+            registered_only = [provider for provider in providers if provider not in built_in_providers]
+            if registered_only:
+                raise ValueError(
+                    "Cannot combine built-in-only providers with device-registered-only providers "
+                    f"{registered_only}; register all requested providers as EP devices or use built-in providers."
+                )
+            if inference_settings.get("provider_selection_policy"):
+                raise ValueError(
+                    "provider_selection_policy requires registered EP devices; the requested built-in-only "
+                    "provider must use explicit execution_provider/provider_options."
+                )
+            use_ep_devices = False
+    if use_ep_devices:
         initialize_inference_session_options(
             sess_options, device, providers, provider_options, inference_settings.get("provider_selection_policy")
         )
