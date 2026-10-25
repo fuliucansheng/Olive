@@ -93,10 +93,11 @@ def get_ort_available_providers():
         # what ORT was built with. Session will be created directly with InferenceSession(model_path, providers=["ProviderName"])
         return ort.get_available_providers()
 
-    # only return registered EPs since session with be created with SessionOptions.add_provider_for_devices()
+    # Built-in providers may be available without a registered plugin EP device.
     # this is ordered by priority
     all_providers = ort.get_all_providers()
     available_provider_set = {ep_device.ep_name for ep_device in ort.get_ep_devices()}
+    available_provider_set.update(ort.get_available_providers())
     return [ep_name for ep_name in all_providers if ep_name in available_provider_set]
 
 
@@ -172,6 +173,8 @@ def get_ort_inference_session(
         execution_provider: list. List of execution providers to use. Can be a list of provider names or a list of
             (provider name, provider options) tuples.
         provider_options: list, optional. List of provider options for the execution providers.
+        allow_cpu_fallback: bool, optional. Defaults to True. Set False for a non-CPU target to reject
+            implicit CPU node placement as well as an unavailable requested provider.
     :param use_ort_extensions: Whether to use onnxruntime-extensions. Default is False.
     :param device_id: Optional device id to use for CUDA or DML execution providers.
     :param external_initializers: Optional external initializers for the session. A dictionary of external initializer
@@ -230,11 +233,28 @@ def get_ort_inference_session(
         sess_options.log_severity_level = log_severity_level
 
     # execution providers and provider options
+    allow_cpu_fallback = inference_settings.get("allow_cpu_fallback", True)
+    if not isinstance(allow_cpu_fallback, bool):
+        raise ValueError("allow_cpu_fallback must be a bool.")
+    available_providers = get_ort_available_providers()
     providers, provider_options = check_and_normalize_provider_args(
         inference_settings.get("execution_provider"),
         inference_settings.get("provider_options"),
-        get_ort_available_providers(),
+        available_providers,
     )
+    if not allow_cpu_fallback:
+        if not providers or "CPUExecutionProvider" in providers:
+            raise ValueError("allow_cpu_fallback=False requires explicit non-CPU execution providers.")
+        missing = [provider for provider in providers if provider not in available_providers]
+        if missing:
+            raise OrtSessionFallbackError(
+                f"Requested providers {missing} are unavailable; available providers: {available_providers}."
+            )
+        if (extra_session_config or {}).get("session.disable_cpu_ep_fallback", "1") != "1":
+            raise ValueError("allow_cpu_fallback=False conflicts with session.disable_cpu_ep_fallback.")
+        # InferenceSession.disable_fallback() only controls the Python EP retry.
+        # This separate ORT setting rejects implicit CPU graph-node placement.
+        sess_options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     for idx, provider in enumerate(providers):
         if provider in ["CUDAExecutionProvider", "DmlExecutionProvider"] and device_id is not None:
             provider_options[idx]["device_id"] = str(device_id)
@@ -254,7 +274,27 @@ def get_ort_inference_session(
         sess_options.enable_mem_pattern = False
 
     sess_kwargs = {}
-    if ort_supports_ep_devices():
+    use_ep_devices = ort_supports_ep_devices()
+    if use_ep_devices:
+        registered_ep_names = {ep_device.ep_name for ep_device in ort.get_ep_devices()}
+        built_in_providers = set(ort.get_available_providers())
+        built_in_only = built_in_providers - registered_ep_names
+        if any(provider in built_in_only for provider in providers):
+            # Keep the complete requested order/options on the legacy constructor path.
+            # Adding some device EPs first would change priority relative to built-in EPs.
+            registered_only = [provider for provider in providers if provider not in built_in_providers]
+            if registered_only:
+                raise ValueError(
+                    "Cannot combine built-in-only providers with device-registered-only providers "
+                    f"{registered_only}; register all requested providers as EP devices or use built-in providers."
+                )
+            if inference_settings.get("provider_selection_policy"):
+                raise ValueError(
+                    "provider_selection_policy requires registered EP devices; the requested built-in-only "
+                    "provider must use explicit execution_provider/provider_options."
+                )
+            use_ep_devices = False
+    if use_ep_devices:
         initialize_inference_session_options(
             sess_options, device, providers, provider_options, inference_settings.get("provider_selection_policy")
         )
